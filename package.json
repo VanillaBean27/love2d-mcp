@@ -1,0 +1,31 @@
+{
+  "name": "love2d-mcp",
+  "version": "0.1.0",
+  "description": "AI-assisted game testing and development for Love2D via the Model Context Protocol",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/love2d-mcp.git"
+  },
+  "keywords": [
+    "love2d",
+    "mcp",
+    "game-development",
+    "ai",
+    "testing",
+    "model-context-protocol"
+  ],
+  "workspaces": [
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=server",
+    "test": "npm run test --workspace=server",
+    "test:integration": "bash tests/integration/test_runner.sh",
+    "lint": "npm run lint --workspace=server",
+    "start": "npm run start --workspace=server"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
