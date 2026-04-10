@@ -40,6 +40,9 @@ local _step_frames = 0
 local _original_callbacks = {}
 local _command_handlers = {}
 local _rate_limiter = { count = 0, reset_time = 0, max_per_second = 60 }
+local _pending_screenshot_requests = {}
+local _virtual_keys = {}          -- key -> frames_remaining
+local _original_isDown = nil      -- original love.keyboard.isDown
 
 --- Initialize the MCP client module.
 --- Call this once in love.load().
@@ -147,11 +150,37 @@ end
 --==========================================================================
 
 function love_mcp._hook_callbacks()
+    -- Patch love.keyboard.isDown to also report virtual (MCP-held) keys.
+    _original_isDown = love.keyboard.isDown
+    love.keyboard.isDown = function(...)
+        -- Check virtual keys first
+        for i = 1, select("#", ...) do
+            local key = select(i, ...)
+            if _virtual_keys[key] then
+                return true
+            end
+        end
+        return _original_isDown(...)
+    end
+
     -- Hook love.update
     _original_callbacks.update = love.update
     love.update = function(dt)
         -- Always poll MCP socket, even when paused
         love_mcp._poll_socket()
+
+        -- Tick down virtual key hold timers; release expired keys.
+        for key, frames in pairs(_virtual_keys) do
+            if frames <= 1 then
+                _virtual_keys[key] = nil
+                -- Fire keyreleased so event-based systems also see it
+                if love.keyreleased then
+                    love.keyreleased(key, key)
+                end
+            else
+                _virtual_keys[key] = frames - 1
+            end
+        end
 
         -- Dispatch one queued input event per frame
         if _input_sim then
@@ -174,13 +203,62 @@ function love_mcp._hook_callbacks()
         end
     end
 
-    -- Hook love.draw (for screenshot capture — post-draw hook)
+    -- Hook love.draw — call captureScreenshot here (required by Love2D 11.4+).
     _original_callbacks.draw = love.draw
     love.draw = function()
         if _original_callbacks.draw then
             _original_callbacks.draw()
         end
-        -- Post-draw: screenshot capture handled in the screenshot command handler
+
+        -- Process any pending screenshot requests.
+        -- captureScreenshot MUST be called inside love.draw; calling it
+        -- from love.update will crash in Love2D 11.4+.
+        if #_pending_screenshot_requests > 0 then
+            local requests = _pending_screenshot_requests
+            _pending_screenshot_requests = {}
+            love.graphics.captureScreenshot(function(image_data)
+                for _, req in ipairs(requests) do
+                    local ok, err = pcall(function()
+                        local src_w, src_h = image_data:getWidth(), image_data:getHeight()
+                        local filename = "_mcp_screenshot.png"
+                        local save_data = image_data
+                        local out_w, out_h = src_w, src_h
+
+                        -- Cap at 960px wide so the saved PNG stays under ~500KB.
+                        if src_w > 960 then
+                            local s = 960 / src_w
+                            out_w = 960
+                            out_h = math.floor(src_h * s)
+                            save_data = love.image.newImageData(out_w, out_h)
+                            local inv = 1.0 / s
+                            for y = 0, out_h - 1 do
+                                for x = 0, out_w - 1 do
+                                    local sx = math.min(math.floor(x * inv), src_w - 1)
+                                    local sy = math.min(math.floor(y * inv), src_h - 1)
+                                    save_data:setPixel(x, y, image_data:getPixel(sx, sy))
+                                end
+                            end
+                        end
+
+                        save_data:encode("png", filename)
+                        if save_data ~= image_data then
+                            save_data:release()
+                        end
+
+                        local full_path = love.filesystem.getSaveDirectory() .. "/" .. filename
+                        love_mcp._send_response(req.id, {
+                            file = full_path,
+                            width = out_w,
+                            height = out_h,
+                            format = "png",
+                        })
+                    end)
+                    if not ok then
+                        love_mcp._send_error(req.id, "HANDLER_ERROR", tostring(err))
+                    end
+                end
+            end)
+        end
     end
 
     -- Hook love.quit
@@ -234,8 +312,11 @@ function love_mcp._handle_request(msg)
         return
     end
 
-    local ok, result = pcall(handler, msg.params or {})
+    local ok, result = pcall(handler, msg.params or {}, msg.id)
     if ok then
+        if type(result) == "table" and result.__deferred then
+            return  -- response will be sent asynchronously
+        end
         love_mcp._send_response(msg.id, result)
     else
         love_mcp._send_error(msg.id, "HANDLER_ERROR", tostring(result))
@@ -290,43 +371,43 @@ function love_mcp._register_handlers()
     _command_handlers["resume"]            = love_mcp._cmd_resume
     _command_handlers["step_frame"]        = love_mcp._cmd_step_frame
     _command_handlers["hot_reload"]        = love_mcp._cmd_hot_reload
+    _command_handlers["hold_keys"]         = love_mcp._cmd_hold_keys
 end
 
 --==========================================================================
 -- Phase 1 Command Handlers
 --==========================================================================
 
-function love_mcp._cmd_screenshot(params)
-    local scale = params.scale or 1.0
-    local w, h = love.graphics.getDimensions()
-    local sw, sh = math.floor(w * scale), math.floor(h * scale)
+function love_mcp._cmd_screenshot(params, id)
+    -- Queue the request; actual captureScreenshot happens in the draw hook
+    -- (Love2D 11.4+ requires it to be called inside love.draw).
+    _pending_screenshot_requests[#_pending_screenshot_requests + 1] = {
+        id = id,
+        params = params or {},
+    }
+    return { __deferred = true }
+end
 
-    local canvas = love.graphics.newCanvas(sw, sh)
-    love.graphics.setCanvas(canvas)
-    love.graphics.clear()
-    love.graphics.push()
-    love.graphics.scale(scale, scale)
-
-    if _original_callbacks.draw then
-        _original_callbacks.draw()
+function love_mcp._cmd_hold_keys(params)
+    local keys = params.keys
+    local frames = params.frames or 30  -- default ~0.5s at 60fps
+    if type(keys) ~= "table" then
+        error("Missing required parameter: keys (array of key names)")
     end
 
-    love.graphics.pop()
-    love.graphics.setCanvas()
-
-    local image_data = canvas:newImageData()
-    local file_data = image_data:encode("png")
-    local bytes = file_data:getString()
-    local b64 = love.data.encode("string", "base64", bytes)
-
-    canvas:release()
-    image_data:release()
+    local held = {}
+    for _, key in ipairs(keys) do
+        _virtual_keys[key] = frames
+        held[#held + 1] = key
+        -- Fire keypressed so event-based systems also see it
+        if love.keypressed then
+            love.keypressed(key, key, false)
+        end
+    end
 
     return {
-        image = b64,
-        width = sw,
-        height = sh,
-        format = "png",
+        held = held,
+        frames = frames,
     }
 end
 

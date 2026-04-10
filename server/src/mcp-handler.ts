@@ -4,8 +4,14 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { spawn, ChildProcess } from 'child_process';
+
 import type { GameBridge } from './game-bridge.js';
 import { logger } from './utils/logger.js';
+
+// Track running processes
+let gameProcess: ChildProcess | null = null;
+let serverProcess: ChildProcess | null = null;
 
 /**
  * Register all MCP tools on the given server.
@@ -13,6 +19,7 @@ import { logger } from './utils/logger.js';
 export function registerTools(server: McpServer, bridge: GameBridge): void {
   registerPhase1Tools(server, bridge);
   registerPhase2Tools(server, bridge);
+  registerManagementTools(server, bridge);
 }
 
 // ==========================================================================
@@ -24,28 +31,59 @@ function registerPhase1Tools(server: McpServer, bridge: GameBridge): void {
   // --- screenshot ---
   server.tool(
     'screenshot',
-    'Capture the current game frame as a base64-encoded PNG image.',
-    {
-      scale: z.number().min(0.1).max(4.0).optional()
-        .describe('Scale factor for the screenshot (default: 1.0)'),
-    },
-    async ({ scale }) => {
-      const result = await bridge.sendCommand('screenshot', { scale: scale ?? 1.0 }) as {
-        image: string; width: number; height: number; format: string;
+    'Capture the current game frame. Returns a file path — use your Read tool to view the image.',
+    {},
+    async () => {
+      const result = await bridge.sendCommand('screenshot', {}) as {
+        file: string; width: number; height: number; format: string;
       };
 
       return {
         content: [
           {
-            type: 'image' as const,
-            data: result.image,
-            mimeType: 'image/png',
-          },
-          {
             type: 'text' as const,
-            text: `Screenshot captured: ${result.width}x${result.height} ${result.format}`,
+            text: `Screenshot saved: ${result.file}\nResolution: ${result.width}x${result.height}\nUse the Read tool on the file path above to view the image.`,
           },
         ],
+      };
+    }
+  );
+
+  // --- move ---
+  server.tool(
+    'move',
+    'Move the player by holding WASD keys for a duration. Use screenshot after moving to see the result.',
+    {
+      direction: z.enum(['up', 'down', 'left', 'right', 'up-left', 'up-right', 'down-left', 'down-right'])
+        .describe('Direction to move'),
+      duration: z.number().min(0.1).max(5.0).optional()
+        .describe('How long to hold the key in seconds (default: 0.5)'),
+    },
+    async ({ direction, duration }) => {
+      const seconds = duration ?? 0.5;
+      const frames = Math.round(seconds * 60); // assume 60fps
+
+      const keyMap: Record<string, string[]> = {
+        'up':         ['w'],
+        'down':       ['s'],
+        'left':       ['a'],
+        'right':      ['d'],
+        'up-left':    ['w', 'a'],
+        'up-right':   ['w', 'd'],
+        'down-left':  ['s', 'a'],
+        'down-right': ['s', 'd'],
+      };
+
+      const keys = keyMap[direction];
+      const result = await bridge.sendCommand('hold_keys', { keys, frames }) as {
+        held: string[]; frames: number;
+      };
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Moving ${direction}: holding [${result.held.join(', ')}] for ${result.frames} frames (~${seconds}s). Use screenshot to see the result after movement completes.`,
+        }],
       };
     }
   );
@@ -303,6 +341,257 @@ function registerPhase2Tools(server: McpServer, bridge: GameBridge): void {
       }
 
       return { content: [{ type: 'text' as const, text }] };
+    }
+  );
+}
+
+// ==========================================================================
+// Management Tools — Process Control
+// ==========================================================================
+
+function registerManagementTools(server: McpServer, bridge: GameBridge): void {
+
+  // --- start_game ---
+  server.tool(
+    'start_game',
+    'Launch the Love2D game process. The game will start with MCP integration enabled.',
+    {
+      gamePath: z.string().optional()
+        .describe('Path to the game directory (default: auto-detect from current working directory)'),
+      lovePath: z.string().optional()
+        .describe('Path to love.exe (default: "C:\\Program Files\\LOVE\\love.exe")'),
+    },
+    async ({ gamePath, lovePath }) => {
+      if (gameProcess && !gameProcess.killed) {
+        return {
+          content: [{ type: 'text' as const, text: 'Game is already running.' }],
+        };
+      }
+
+      const gameDir = gamePath || 'C:\\Users\\Camden\\Documents\\MyGame\\CubicleAndCauldron';
+      const loveExe = lovePath || 'C:\\Program Files\\LOVE\\love.exe';
+
+      try {
+        // Ensure the game directory exists
+        const fs = await import('fs');
+        if (!fs.existsSync(gameDir)) {
+          return {
+            content: [{ type: 'text' as const, text: `Game directory not found: ${gameDir}` }],
+          };
+        }
+
+        // Check if main.lua exists
+        const mainLuaPath = `${gameDir}\\main.lua`;
+        if (!fs.existsSync(mainLuaPath)) {
+          return {
+            content: [{ type: 'text' as const, text: `main.lua not found in: ${mainLuaPath}` }],
+          };
+        }
+
+        logger.info(`Starting game from: ${gameDir}`);
+        logger.info(`Using Love2D: ${loveExe}`);
+
+        // Try launching with the directory path instead of "."
+        gameProcess = spawn(loveExe, [gameDir], {
+          detached: true,
+          stdio: 'ignore',
+        });
+
+        logger.info(`Game process spawned with PID: ${gameProcess.pid}`);
+
+        // Wait for the game to start and MCP to connect
+        let attempts = 0;
+        const maxAttempts = 30; // 30 seconds
+        const checkInterval = 1000;
+
+        const checkConnection = async () => {
+          attempts++;
+          try {
+            // Try to send a simple command to see if the game is connected
+            await bridge.sendCommand('get_game_info', {});
+            logger.info('Game MCP connection established');
+            return true;
+          } catch (err) {
+            if (attempts >= maxAttempts) {
+              logger.error(`Game failed to connect after ${maxAttempts} seconds`);
+              return false;
+            }
+            // Wait and try again
+            await new Promise(resolve => setTimeout(resolve, checkInterval));
+            return checkConnection();
+          }
+        };
+
+        const connected = await checkConnection();
+
+        if (!connected) {
+          // Kill the process if it didn't connect
+          try {
+            gameProcess.kill('SIGTERM');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (!gameProcess.killed) {
+              gameProcess.kill('SIGKILL');
+            }
+          } catch (err) {
+            logger.error('Failed to kill unresponsive game process:', err);
+          }
+          gameProcess = null;
+          return {
+            content: [{ type: 'text' as const, text: `Game started but MCP connection failed. The game may have crashed or MCP failed to initialize.` }],
+          };
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: `Game started successfully from ${gameDir}. PID: ${gameProcess.pid}` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Failed to start game: ${(err as Error).message}` }],
+        };
+      }
+    }
+  );
+
+  // --- stop_game ---
+  server.tool(
+    'stop_game',
+    'Stop the running Love2D game process.',
+    {},
+    async () => {
+      if (!gameProcess || gameProcess.killed) {
+        return {
+          content: [{ type: 'text' as const, text: 'No game process is currently running.' }],
+        };
+      }
+
+      try {
+        gameProcess.kill('SIGTERM');
+        // Wait a bit for graceful shutdown
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        if (!gameProcess.killed) {
+          gameProcess.kill('SIGKILL');
+        }
+
+        const pid = gameProcess.pid;
+        gameProcess = null;
+
+        return {
+          content: [{ type: 'text' as const, text: `Game stopped successfully. PID: ${pid}` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Failed to stop game: ${(err as Error).message}` }],
+        };
+      }
+    }
+  );
+
+  // --- start_server ---
+  server.tool(
+    'start_server',
+    'Launch the MCP server process. Note: This tool is usually not needed since the server should already be running.',
+    {
+      serverPath: z.string().optional()
+        .describe('Path to the server directory (default: auto-detect)'),
+    },
+    async ({ serverPath }) => {
+      if (serverProcess && !serverProcess.killed) {
+        return {
+          content: [{ type: 'text' as const, text: 'Server is already running.' }],
+        };
+      }
+
+      const serverDir = serverPath || process.cwd();
+
+      try {
+        serverProcess = spawn('node', ['dist/index.js'], {
+          cwd: serverDir,
+          detached: true,
+          stdio: 'ignore',
+        });
+
+        serverProcess.on('error', (err) => {
+          logger.error('Failed to start server:', err);
+        });
+
+        serverProcess.on('exit', (code) => {
+          logger.info(`Server exited with code ${code}`);
+          serverProcess = null;
+        });
+
+        // Give it a moment to start
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        return {
+          content: [{ type: 'text' as const, text: `Server started successfully. PID: ${serverProcess.pid}` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Failed to start server: ${(err as Error).message}` }],
+        };
+      }
+    }
+  );
+
+  // --- stop_server ---
+  server.tool(
+    'stop_server',
+    'Stop the running MCP server process.',
+    {},
+    async () => {
+      if (!serverProcess || serverProcess.killed) {
+        return {
+          content: [{ type: 'text' as const, text: 'No server process is currently running.' }],
+        };
+      }
+
+      try {
+        serverProcess.kill('SIGTERM');
+        // Wait a bit for graceful shutdown
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        if (!serverProcess.killed) {
+          serverProcess.kill('SIGKILL');
+        }
+
+        const pid = serverProcess.pid;
+        serverProcess = null;
+
+        return {
+          content: [{ type: 'text' as const, text: `Server stopped successfully. PID: ${pid}` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Failed to stop server: ${(err as Error).message}` }],
+        };
+      }
+    }
+  );
+
+  // --- get_status ---
+  server.tool(
+    'get_status',
+    'Get the current status of the game and server processes.',
+    {},
+    async () => {
+      const gameRunning = gameProcess && !gameProcess.killed;
+      const serverRunning = serverProcess && !serverProcess.killed;
+
+      let status = 'Status:\n';
+      status += `Game: ${gameRunning ? 'Running' : 'Not running'}`;
+      if (gameRunning && gameProcess) {
+        status += ` (PID: ${gameProcess.pid})`;
+      }
+      status += '\n';
+      status += `Server: ${serverRunning ? 'Running' : 'Not running'}`;
+      if (serverRunning && serverProcess) {
+        status += ` (PID: ${serverProcess.pid})`;
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: status }],
+      };
     }
   );
 }
