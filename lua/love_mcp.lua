@@ -44,6 +44,14 @@ local _pending_screenshot_requests = {}
 local _virtual_keys = {}          -- key -> frames_remaining
 local _original_isDown = nil      -- original love.keyboard.isDown
 
+-- Stable references to our installed callback hook functions. Used to
+-- detect "is love.update currently our wrapper?" so we can safely
+-- re-install hooks after a hot reload without infinite recursion.
+local _hook_update = nil
+local _hook_draw = nil
+local _hook_quit = nil
+local _hook_isDown = nil
+
 --- Initialize the MCP client module.
 --- Call this once in love.load().
 ---@param opts table|nil  Configuration options
@@ -65,6 +73,7 @@ function love_mcp.init(opts)
         max_commands_per_second = opts.max_commands_per_second or 60,
         game_state_ref    = opts.game_state or nil,
         scene_getter      = opts.get_current_scene or nil,
+        hot_reload_skip   = opts.hot_reload_skip or nil,
     }
     _rate_limiter.max_per_second = _config.max_commands_per_second
 
@@ -151,8 +160,12 @@ end
 
 function love_mcp._hook_callbacks()
     -- Patch love.keyboard.isDown to also report virtual (MCP-held) keys.
-    _original_isDown = love.keyboard.isDown
-    love.keyboard.isDown = function(...)
+    -- Only capture the original if love.keyboard.isDown isn't already our hook
+    -- (otherwise we'd recurse infinitely on rehook).
+    if love.keyboard.isDown ~= _hook_isDown then
+        _original_isDown = love.keyboard.isDown
+    end
+    _hook_isDown = function(...)
         -- Check virtual keys first
         for i = 1, select("#", ...) do
             local key = select(i, ...)
@@ -162,10 +175,13 @@ function love_mcp._hook_callbacks()
         end
         return _original_isDown(...)
     end
+    love.keyboard.isDown = _hook_isDown
 
-    -- Hook love.update
-    _original_callbacks.update = love.update
-    love.update = function(dt)
+    -- Hook love.update — capture user's callback only if not already our hook.
+    if love.update ~= _hook_update then
+        _original_callbacks.update = love.update
+    end
+    _hook_update = function(dt)
         -- Always poll MCP socket, even when paused
         love_mcp._poll_socket()
 
@@ -202,10 +218,13 @@ function love_mcp._hook_callbacks()
             _original_callbacks.update(dt)
         end
     end
+    love.update = _hook_update
 
     -- Hook love.draw — call captureScreenshot here (required by Love2D 11.4+).
-    _original_callbacks.draw = love.draw
-    love.draw = function()
+    if love.draw ~= _hook_draw then
+        _original_callbacks.draw = love.draw
+    end
+    _hook_draw = function()
         if _original_callbacks.draw then
             _original_callbacks.draw()
         end
@@ -260,15 +279,31 @@ function love_mcp._hook_callbacks()
             end)
         end
     end
+    love.draw = _hook_draw
 
     -- Hook love.quit
-    _original_callbacks.quit = love.quit
-    love.quit = function()
+    if love.quit ~= _hook_quit then
+        _original_callbacks.quit = love.quit
+    end
+    _hook_quit = function()
+        -- Capture user's quit before shutdown(): shutdown() reassigns
+        -- _original_callbacks to an empty table, which would otherwise drop
+        -- the user's quit handler and skip save-on-quit logic.
+        local user_quit = _original_callbacks.quit
         love_mcp.shutdown()
-        if _original_callbacks.quit then
-            return _original_callbacks.quit()
+        if user_quit then
+            return user_quit()
         end
     end
+    love.quit = _hook_quit
+end
+
+--- Re-install our love.* callback hooks after a hot reload that may have
+--- replaced love.update / love.draw / love.quit with the user's freshly
+--- re-required versions. Safe to call repeatedly — uses identity checks
+--- to avoid double-wrapping.
+function love_mcp._rehook_after_reload()
+    love_mcp._hook_callbacks()
 end
 
 --==========================================================================
@@ -546,19 +581,57 @@ function love_mcp._cmd_simulate_input(params)
     }
 end
 
+--- Coerce a value (and recurse into tables) so numeric/boolean strings
+--- become real numbers/booleans before being written into game state.
+--- MCP clients frequently send primitives as JSON strings; without this
+--- a write of `10` lands as the string `"10"`.
+local function _coerce_value(v)
+    if type(v) == "string" then
+        if v == "true"  then return true  end
+        if v == "false" then return false end
+        if v == "null" or v == "nil" then return nil end
+        -- Only coerce clean numeric strings; leave "1.0abc" or "" alone.
+        if v ~= "" and (v:match("^%-?%d+$") or v:match("^%-?%d+%.%d+$")) then
+            local n = tonumber(v)
+            if n then return n end
+        end
+        return v
+    elseif type(v) == "table" then
+        local out = {}
+        for k, val in pairs(v) do
+            out[k] = _coerce_value(val)
+        end
+        return out
+    end
+    return v
+end
+
 function love_mcp._cmd_set_game_state(params)
     if not params.path then error("Missing required parameter: path") end
 
-    local root = {}
-    if _config.expose_globals then
-        for k, v in pairs(_G) do
-            if type(k) == "string" then root[k] = v end
-        end
-    end
-    if _config.game_state_ref then
-        for k, v in pairs(_config.game_state_ref) do
-            root[k] = v
-        end
+    -- Coerce string-encoded primitives to their real types. Defends against
+    -- MCP clients (or older server builds) that JSON-encode numbers/booleans
+    -- as strings.
+    params.value = _coerce_value(params.value)
+
+    -- Pick a root table that is a REAL reference, not a copy. The previous
+    -- implementation built a local merged table from _G + game_state_ref;
+    -- top-level primitive writes only mutated the local copy and were lost.
+    --
+    -- For nested paths the shallow-copy bug was masked (tables are by
+    -- reference in Lua), but for top-level scalars like a global flag it
+    -- silently failed. Always write through to the actual table.
+    local top_key = params.path:match("^[^%.]+")
+    local root
+
+    if _config.game_state_ref and _config.game_state_ref[top_key] ~= nil then
+        root = _config.game_state_ref
+    elseif _config.expose_globals then
+        root = _G
+    elseif _config.game_state_ref then
+        root = _config.game_state_ref
+    else
+        error("No writable state root configured (enable expose_globals or pass game_state to mcp.init)")
     end
 
     local previous, err = state_inspector.set(
@@ -570,9 +643,13 @@ function love_mcp._cmd_set_game_state(params)
 
     if err then error(err) end
 
+    -- Read back the actual stored value so the response truly confirms the
+    -- write landed (rather than echoing the requested value).
+    local actual = state_inspector.resolve(params.path, root)
+
     return {
         previous_value = state_inspector.serialize(previous, 3),
-        new_value = state_inspector.serialize(params.value, 3),
+        new_value = state_inspector.serialize(actual, 3),
     }
 end
 
@@ -618,20 +695,100 @@ function love_mcp._cmd_hot_reload(params)
             end
         end
     else
-        -- Reload all non-standard modules
-        local skip = { love_mcp = true, socket = true, mime = true, ltn12 = true }
-        for name, _ in pairs(package.loaded) do
-            if type(name) == "string" and not skip[name] and not name:match("^love%.") and not name:match("^love_mcp") then
-                package.loaded[name] = nil
-                local ok, err = pcall(require, name)
-                if ok then
-                    reloaded[#reloaded + 1] = name
-                else
-                    errors[#errors + 1] = name .. ": " .. tostring(err)
+        -- Reload all non-standard modules.
+        --
+        -- Three important details:
+        --   1. Collect names FIRST, then iterate the list. Modifying
+        --      package.loaded during a `pairs` traversal is undefined
+        --      behavior in Lua and was crashing the MCP bridge.
+        --   2. Skip love_mcp itself, Love2D, the Lua stdlib, LuaSocket,
+        --      `main`, `_G`, `arg` etc. Re-requiring `main` would re-run
+        --      love.load and re-call mcp.init(), blowing up the listener.
+        --      Re-requiring stdlib modules (string, table, math, ...) is
+        --      meaningless and only invites breakage.
+        --   3. Honor a developer-provided extra skip list/patterns via
+        --      mcp.init({ hot_reload_skip = { "libraries.hc", "^vendor%." } })
+        --      so third-party libs with load-order dependencies (e.g.
+        --      hardoncollider) can be excluded from full reloads.
+        local skip_exact = {
+            -- Lua stdlib — never safe to reload
+            string = true, table = true, math = true, io = true, os = true,
+            coroutine = true, debug = true, package = true,
+            utf8 = true, bit = true, bit32 = true, ffi = true, jit = true,
+            ["jit.opt"] = true, ["jit.util"] = true,
+            -- Love2D core
+            love = true,
+            -- Special globals / entry points
+            _G = true, _ENV = true, main = true, arg = true,
+            -- LuaSocket and friends
+            socket = true, mime = true, ltn12 = true,
+            ["socket.core"] = true, ["socket.url"] = true,
+            ["socket.http"] = true, ["socket.tp"] = true,
+            ["socket.smtp"] = true, ["socket.ftp"] = true,
+        }
+
+        -- Developer-provided extra skips. Strings starting with "^" are
+        -- treated as Lua patterns; everything else is matched as an exact
+        -- module name AND as a dot-prefix (so "libraries.hc" also skips
+        -- "libraries.hc.polygon", "libraries.hc.shapes", etc.).
+        local extra_skip_exact = {}
+        local extra_skip_patterns = {}
+        local extra_skip_prefixes = {}
+        if _config.hot_reload_skip then
+            for _, entry in ipairs(_config.hot_reload_skip) do
+                if type(entry) == "string" then
+                    if entry:sub(1, 1) == "^" then
+                        extra_skip_patterns[#extra_skip_patterns + 1] = entry
+                    else
+                        extra_skip_exact[entry] = true
+                        extra_skip_prefixes[#extra_skip_prefixes + 1] = entry .. "."
+                    end
                 end
             end
         end
+
+        local function should_skip(name)
+            if type(name) ~= "string" then return true end
+            if skip_exact[name] then return true end
+            if extra_skip_exact[name] then return true end
+            if name:match("^love%.") then return true end
+            -- Skip love_mcp and any submodule regardless of how it was required
+            -- (love_mcp, libs.love_mcp, etc.)
+            if name == "love_mcp" or name:match("^love_mcp%.") then return true end
+            if name:find("love_mcp", 1, true) then return true end
+            for _, prefix in ipairs(extra_skip_prefixes) do
+                if name:sub(1, #prefix) == prefix then return true end
+            end
+            for _, pat in ipairs(extra_skip_patterns) do
+                if name:match(pat) then return true end
+            end
+            return false
+        end
+
+        -- Snapshot module names before mutation.
+        local names = {}
+        for name, _ in pairs(package.loaded) do
+            if not should_skip(name) then
+                names[#names + 1] = name
+            end
+        end
+
+        for _, name in ipairs(names) do
+            package.loaded[name] = nil
+            local ok, err = pcall(require, name)
+            if ok then
+                reloaded[#reloaded + 1] = name
+            else
+                errors[#errors + 1] = name .. ": " .. tostring(err)
+            end
+        end
     end
+
+    -- Critical: re-install love callback hooks. If any reloaded user module
+    -- has top-level code like `function love.update(dt) ... end`, the require
+    -- just replaced our wrapper, severing _poll_socket from the frame loop
+    -- and killing the bridge. Re-hook to restore it.
+    love_mcp._rehook_after_reload()
 
     return { reloaded = reloaded, errors = errors }
 end

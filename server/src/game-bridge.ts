@@ -160,8 +160,14 @@ export class GameBridge extends EventEmitter {
 
   /** Handle an incoming message from the game. */
   private handleMessage(msg: GameMessage): void {
+    // ANY incoming byte from the peer proves liveness — not just heartbeats.
+    // This matters when a long-running command (e.g. hot_reload of hundreds
+    // of modules) blocks love.update for many seconds: by the time the
+    // response arrives, the heartbeat-only check would already have
+    // declared the peer dead.
+    this.lastHeartbeatResponse = Date.now();
+
     if (msg.type === 'heartbeat') {
-      this.lastHeartbeatResponse = Date.now();
       return;
     }
 
@@ -200,6 +206,13 @@ export class GameBridge extends EventEmitter {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this._connected || !this.socket) return;
+
+      // If a request is in flight, the peer is busy executing it (potentially
+      // a long-running operation like hot_reload of hundreds of modules that
+      // blocks love.update). Don't enforce heartbeat timeout — the request
+      // itself has its own timeout (requestTimeout) that will fire if the
+      // peer is genuinely stuck.
+      if (this.pendingRequests.size > 0) return;
 
       // Check for heartbeat timeout
       const elapsed = Date.now() - this.lastHeartbeatResponse;

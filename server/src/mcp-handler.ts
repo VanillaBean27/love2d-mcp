@@ -4,14 +4,119 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, ChildProcess, execSync } from 'child_process';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 
 import type { GameBridge } from './game-bridge.js';
 import { logger } from './utils/logger.js';
 
-// Track running processes
+// Track running game process
 let gameProcess: ChildProcess | null = null;
-let serverProcess: ChildProcess | null = null;
+
+/**
+ * Auto-detect the Love2D executable by searching common install locations per OS.
+ * Returns the path if found, or null.
+ */
+function detectLovePath(): string | null {
+  const platform = os.platform();
+
+  // Check if 'love' is on PATH first (works on all platforms)
+  try {
+    const cmd = platform === 'win32' ? 'where love' : 'which love';
+    const result = execSync(cmd, { encoding: 'utf-8', timeout: 5000 }).trim();
+    if (result) {
+      const firstLine = result.split('\n')[0].trim();
+      if (fs.existsSync(firstLine)) return firstLine;
+    }
+  } catch {
+    // Not on PATH, check common locations
+  }
+
+  const candidates: string[] = [];
+
+  if (platform === 'win32') {
+    candidates.push(
+      'C:\\Program Files\\LOVE\\love.exe',
+      'C:\\Program Files (x86)\\LOVE\\love.exe',
+      path.join(os.homedir(), 'scoop', 'apps', 'love', 'current', 'love.exe'),
+    );
+  } else if (platform === 'darwin') {
+    candidates.push(
+      '/Applications/love.app/Contents/MacOS/love',
+      path.join(os.homedir(), 'Applications', 'love.app', 'Contents', 'MacOS', 'love'),
+    );
+  } else {
+    // Linux — typically on PATH (checked above), but check common spots
+    candidates.push(
+      '/usr/bin/love',
+      '/usr/local/bin/love',
+      '/snap/bin/love',
+    );
+  }
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+/**
+ * Coerce a value that may have arrived as a string from an MCP client into
+ * its likely intended primitive type. Recurses into arrays and plain objects.
+ *
+ * MCP clients (including Claude) frequently pass numbers and booleans as
+ * JSON strings when the tool schema uses an unconstrained `z.any()`. Without
+ * this, set_game_state would write `"10"` instead of `10`.
+ */
+export function coerceValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    if (value === 'null') return null;
+    // Numeric strings: must be a finite number and round-trip cleanly so we
+    // don't accidentally turn "01" or "1.0abc" or "" into a number.
+    if (value !== '' && /^-?\d+(\.\d+)?$/.test(value)) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(coerceValue);
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = coerceValue(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Kill a child process in a cross-platform way.
+ */
+function killProcess(proc: ChildProcess): void {
+  if (!proc.pid) return;
+
+  if (os.platform() === 'win32') {
+    try {
+      execSync(`taskkill /PID ${proc.pid} /T /F`, { timeout: 5000 });
+    } catch {
+      // Process may have already exited
+    }
+  } else {
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // Already dead
+    }
+  }
+}
 
 /**
  * Register all MCP tools on the given server.
@@ -259,7 +364,11 @@ function registerPhase2Tools(server: McpServer, bridge: GameBridge): void {
       value: z.any().describe('The new value to set'),
     },
     async ({ path, value }) => {
-      const result = await bridge.sendCommand('set_game_state', { path, value }) as {
+      // MCP clients often pass numeric/boolean values as strings because the
+      // z.any() schema is unconstrained. Coerce common cases so Lua receives
+      // the correct type.
+      const coerced = coerceValue(value);
+      const result = await bridge.sendCommand('set_game_state', { path, value: coerced }) as {
         previous_value: unknown; new_value: unknown;
       };
       return {
@@ -357,9 +466,9 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
     'Launch the Love2D game process. The game will start with MCP integration enabled.',
     {
       gamePath: z.string().optional()
-        .describe('Path to the game directory (default: auto-detect from current working directory)'),
+        .describe('Path to the game directory containing main.lua'),
       lovePath: z.string().optional()
-        .describe('Path to love.exe (default: "C:\\Program Files\\LOVE\\love.exe")'),
+        .describe('Path to the Love2D executable (auto-detected if not provided)'),
     },
     async ({ gamePath, lovePath }) => {
       if (gameProcess && !gameProcess.killed) {
@@ -368,55 +477,78 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
         };
       }
 
-      const gameDir = gamePath || 'C:\\Users\\Camden\\Documents\\MyGame\\CubicleAndCauldron';
-      const loveExe = lovePath || 'C:\\Program Files\\LOVE\\love.exe';
+      // Resolve game directory: explicit arg > env var > error
+      const gameDir = gamePath
+        || process.env.LOVE_MCP_GAME_PATH
+        || null;
+
+      if (!gameDir) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: 'No game path provided. Pass gamePath, or set the LOVE_MCP_GAME_PATH environment variable.',
+          }],
+        };
+      }
+
+      // Resolve Love2D executable: explicit arg > env var > auto-detect > error
+      const loveExe = lovePath
+        || process.env.LOVE_MCP_LOVE_PATH
+        || detectLovePath();
+
+      if (!loveExe) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: 'Could not find Love2D. Install it and ensure it\'s on your PATH, pass lovePath, or set the LOVE_MCP_LOVE_PATH environment variable.',
+          }],
+        };
+      }
 
       try {
-        // Ensure the game directory exists
-        const fs = await import('fs');
-        if (!fs.existsSync(gameDir)) {
+        const resolvedGameDir = path.resolve(gameDir);
+
+        if (!fs.existsSync(resolvedGameDir)) {
           return {
-            content: [{ type: 'text' as const, text: `Game directory not found: ${gameDir}` }],
+            content: [{ type: 'text' as const, text: `Game directory not found: ${resolvedGameDir}` }],
           };
         }
 
-        // Check if main.lua exists
-        const mainLuaPath = `${gameDir}\\main.lua`;
+        const mainLuaPath = path.join(resolvedGameDir, 'main.lua');
         if (!fs.existsSync(mainLuaPath)) {
           return {
-            content: [{ type: 'text' as const, text: `main.lua not found in: ${mainLuaPath}` }],
+            content: [{ type: 'text' as const, text: `main.lua not found in: ${resolvedGameDir}` }],
           };
         }
 
-        logger.info(`Starting game from: ${gameDir}`);
+        logger.info(`Starting game from: ${resolvedGameDir}`);
         logger.info(`Using Love2D: ${loveExe}`);
 
-        // Try launching with the directory path instead of "."
-        gameProcess = spawn(loveExe, [gameDir], {
+        gameProcess = spawn(loveExe, [resolvedGameDir], {
           detached: true,
           stdio: 'ignore',
         });
+
+        gameProcess.on('exit', () => { gameProcess = null; });
 
         logger.info(`Game process spawned with PID: ${gameProcess.pid}`);
 
         // Wait for the game to start and MCP to connect
         let attempts = 0;
-        const maxAttempts = 30; // 30 seconds
+        const maxAttempts = 30;
         const checkInterval = 1000;
 
-        const checkConnection = async () => {
+        const checkConnection = async (): Promise<boolean> => {
           attempts++;
           try {
-            // Try to send a simple command to see if the game is connected
             await bridge.sendCommand('get_game_info', {});
             logger.info('Game MCP connection established');
             return true;
-          } catch (err) {
+          } catch {
             if (attempts >= maxAttempts) {
               logger.error(`Game failed to connect after ${maxAttempts} seconds`);
               return false;
             }
-            // Wait and try again
             await new Promise(resolve => setTimeout(resolve, checkInterval));
             return checkConnection();
           }
@@ -425,24 +557,17 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
         const connected = await checkConnection();
 
         if (!connected) {
-          // Kill the process if it didn't connect
-          try {
-            gameProcess.kill('SIGTERM');
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            if (!gameProcess.killed) {
-              gameProcess.kill('SIGKILL');
-            }
-          } catch (err) {
-            logger.error('Failed to kill unresponsive game process:', err);
+          if (gameProcess) {
+            killProcess(gameProcess);
+            gameProcess = null;
           }
-          gameProcess = null;
           return {
-            content: [{ type: 'text' as const, text: `Game started but MCP connection failed. The game may have crashed or MCP failed to initialize.` }],
+            content: [{ type: 'text' as const, text: 'Game started but MCP connection failed. The game may have crashed or love_mcp failed to initialize.' }],
           };
         }
 
         return {
-          content: [{ type: 'text' as const, text: `Game started successfully from ${gameDir}. PID: ${gameProcess.pid}` }],
+          content: [{ type: 'text' as const, text: `Game started successfully from ${resolvedGameDir}. PID: ${gameProcess?.pid}` }],
         };
       } catch (err) {
         return {
@@ -465,15 +590,10 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
       }
 
       try {
-        gameProcess.kill('SIGTERM');
-        // Wait a bit for graceful shutdown
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        if (!gameProcess.killed) {
-          gameProcess.kill('SIGKILL');
-        }
-
         const pid = gameProcess.pid;
+        killProcess(gameProcess);
+        // Give it a moment to die
+        await new Promise(resolve => setTimeout(resolve, 1000));
         gameProcess = null;
 
         return {
@@ -487,88 +607,6 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
     }
   );
 
-  // --- start_server ---
-  server.tool(
-    'start_server',
-    'Launch the MCP server process. Note: This tool is usually not needed since the server should already be running.',
-    {
-      serverPath: z.string().optional()
-        .describe('Path to the server directory (default: auto-detect)'),
-    },
-    async ({ serverPath }) => {
-      if (serverProcess && !serverProcess.killed) {
-        return {
-          content: [{ type: 'text' as const, text: 'Server is already running.' }],
-        };
-      }
-
-      const serverDir = serverPath || process.cwd();
-
-      try {
-        serverProcess = spawn('node', ['dist/index.js'], {
-          cwd: serverDir,
-          detached: true,
-          stdio: 'ignore',
-        });
-
-        serverProcess.on('error', (err) => {
-          logger.error('Failed to start server:', err);
-        });
-
-        serverProcess.on('exit', (code) => {
-          logger.info(`Server exited with code ${code}`);
-          serverProcess = null;
-        });
-
-        // Give it a moment to start
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        return {
-          content: [{ type: 'text' as const, text: `Server started successfully. PID: ${serverProcess.pid}` }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text' as const, text: `Failed to start server: ${(err as Error).message}` }],
-        };
-      }
-    }
-  );
-
-  // --- stop_server ---
-  server.tool(
-    'stop_server',
-    'Stop the running MCP server process.',
-    {},
-    async () => {
-      if (!serverProcess || serverProcess.killed) {
-        return {
-          content: [{ type: 'text' as const, text: 'No server process is currently running.' }],
-        };
-      }
-
-      try {
-        serverProcess.kill('SIGTERM');
-        // Wait a bit for graceful shutdown
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        if (!serverProcess.killed) {
-          serverProcess.kill('SIGKILL');
-        }
-
-        const pid = serverProcess.pid;
-        serverProcess = null;
-
-        return {
-          content: [{ type: 'text' as const, text: `Server stopped successfully. PID: ${pid}` }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text' as const, text: `Failed to stop server: ${(err as Error).message}` }],
-        };
-      }
-    }
-  );
-
   // --- get_status ---
   server.tool(
     'get_status',
@@ -576,7 +614,7 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
     {},
     async () => {
       const gameRunning = gameProcess && !gameProcess.killed;
-      const serverRunning = serverProcess && !serverProcess.killed;
+      const detectedLove = detectLovePath();
 
       let status = 'Status:\n';
       status += `Game: ${gameRunning ? 'Running' : 'Not running'}`;
@@ -584,10 +622,9 @@ function registerManagementTools(server: McpServer, bridge: GameBridge): void {
         status += ` (PID: ${gameProcess.pid})`;
       }
       status += '\n';
-      status += `Server: ${serverRunning ? 'Running' : 'Not running'}`;
-      if (serverRunning && serverProcess) {
-        status += ` (PID: ${serverProcess.pid})`;
-      }
+      status += `Love2D: ${detectedLove || 'Not found (set LOVE_MCP_LOVE_PATH or install Love2D)'}`;
+      status += '\n';
+      status += `Platform: ${os.platform()} (${os.arch()})`;
 
       return {
         content: [{ type: 'text' as const, text: status }],
